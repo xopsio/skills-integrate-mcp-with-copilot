@@ -7,6 +7,7 @@ from sqlalchemy import (
     String,
     UniqueConstraint,
 )
+from sqlalchemy.orm import relationship
 
 from src.database import Base
 
@@ -16,6 +17,10 @@ class User(Base):
 
     id = Column(Integer, primary_key=True)
     email = Column(String, nullable=False, unique=True)
+
+    registrations = relationship(
+        "Registration", back_populates="user", passive_deletes="all"
+    )
 
 
 class Activity(Base):
@@ -27,6 +32,10 @@ class Activity(Base):
     schedule = Column(String, nullable=False)
     max_participants = Column(Integer, nullable=False)
 
+    registrations = relationship(
+        "Registration", back_populates="activity", passive_deletes="all"
+    )
+
 
 class Registration(Base):
     __tablename__ = "registrations"
@@ -34,6 +43,9 @@ class Registration(Base):
     id = Column(Integer, primary_key=True)
     user_id = Column(Integer, nullable=False)
     activity_id = Column(Integer, nullable=False)
+
+    user = relationship("User", back_populates="registrations")
+    activity = relationship("Activity", back_populates="registrations")
 
     __table_args__ = (
         UniqueConstraint("user_id", "activity_id"),
