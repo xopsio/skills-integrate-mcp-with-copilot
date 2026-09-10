@@ -1,10 +1,8 @@
 from logging.config import fileConfig
 
-from sqlalchemy import engine_from_config, pool
-
 from alembic import context
 
-from src.database import DATABASE_URL, Base  # noqa: E402
+from src.database import DATABASE_URL, Base, engine  # noqa: E402
 
 # Import models so their tables are registered on Base.metadata before
 # Alembic autogenerate inspects it.  This import has side-effects and
@@ -38,15 +36,13 @@ def run_migrations_offline() -> None:
 
 
 def run_migrations_online() -> None:
-    """Run migrations in 'online' mode."""
-    connectable = engine_from_config(
-        config.get_section(config.config_ini_section, {}),
-        prefix="sqlalchemy.",
-        poolclass=pool.NullPool,
-        url=DATABASE_URL,
-    )
+    """Run migrations in 'online' mode.
 
-    with connectable.connect() as connection:
+    Reuses the application engine from src.database so the SQLite
+    foreign-key PRAGMA listener attached there applies to Alembic's
+    migration connection as well.
+    """
+    with engine.connect() as connection:
         context.configure(
             connection=connection, target_metadata=target_metadata
         )
