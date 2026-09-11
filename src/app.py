@@ -12,7 +12,7 @@ from fastapi import Depends, FastAPI, HTTPException
 from fastapi.responses import RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from sqlalchemy.exc import IntegrityError
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, selectinload
 
 from src.database import get_db
 from src.models import Activity, Registration, User
@@ -57,17 +57,21 @@ def root():
 
 @app.get("/activities")
 def get_activities(db: Session = Depends(get_db)):
-    activities = db.query(Activity).order_by(Activity.id).all()
+    activities = (
+        db.query(Activity)
+        .order_by(Activity.id)
+        .options(
+            selectinload(Activity.registrations).selectinload(
+                Registration.user
+            )
+        )
+        .all()
+    )
     result = {}
     for activity in activities:
         participants = [
             reg.user.email
-            for reg in sorted(
-                db.query(Registration)
-                .filter_by(activity_id=activity.id)
-                .all(),
-                key=lambda r: r.id,
-            )
+            for reg in sorted(activity.registrations, key=lambda r: r.id)
         ]
         result[activity.name] = {
             "description": activity.description,

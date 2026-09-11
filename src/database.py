@@ -4,6 +4,8 @@ import os
 import pathlib
 import sqlite3
 
+from collections.abc import Iterator
+
 from sqlalchemy import MetaData, create_engine, event
 from sqlalchemy.orm import Session, declarative_base, sessionmaker
 
@@ -44,7 +46,7 @@ _naming_convention = {
 Base = declarative_base(metadata=MetaData(naming_convention=_naming_convention))
 
 
-def get_db() -> Session:
+def get_db() -> Iterator[Session]:
     """FastAPI dependency that yields a request-scoped Session."""
     db = SessionLocal()
     try:
