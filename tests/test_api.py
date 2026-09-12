@@ -392,109 +392,124 @@ class SessionDependencyTests(_BaseApiTests):
 
 
 class UserEmailRaceRecoveryTests(_BaseApiTests):
-    """Verify the actual IntegrityError recovery control flow in
-    _get_or_create_user. This is an instrumented control-flow test;
-    it is NOT a real concurrent-database integration test.
+    """Verify that _get_or_create_user recovers from a real UNIQUE
+    violation on uq_users_email.
 
-    The test deliberately primes the helper into the recovery branch by
-    pre-existing a competing User row in a separate Session before the
-    helper is called, and by intercepting `flush()` to raise
-    IntegrityError the first time it is called during this single
-    _get_or_create_user invocation. The control flow that is exercised:
-
-      1. initial User lookup returns no row (because the DB row exists in a
-         different Session and our fresh session has not yet loaded it);
-      2. helper enters the nested transaction / savepoint path;
-      3. flush() raises IntegrityError (mocked on this call only);
-      4. except branch recovers by querying the User by email again;
-      5. the recovery lookup returns the competing User;
-      6. _get_or_create_user returns the competing User;
-      7. full Session.rollback() is NOT called.
+    This is a deterministically instrumented race window with a real
+    database UNIQUE failure — NOT a real concurrent integration test.
+    The competing User row is committed with a separate Session, and only
+    the helper's FIRST email lookup is forced to miss; the INSERT itself
+    is not mocked, so SQLite raises the actual IntegrityError inside the
+    savepoint, and the recovery lookup runs the original implementation.
     """
 
-    def test_recovery_branch_executes_and_returns_competing_user(self):
+    def test_recovery_branch_with_real_unique_violation(self):
         from sqlalchemy.exc import IntegrityError
+        from sqlalchemy.orm import Session as _Session
 
         email = "race@example.com"
 
-        # Pre-create the competing User in a separate, committed Session.
+        # 1. Commit the competing User with a separate Session.
         priming = SessionLocal()
         try:
-            priming.add(User(email=email))
+            competing = User(email=email)
+            priming.add(competing)
             priming.commit()
+            competing_id = competing.id
         finally:
             priming.close()
 
-        # Use a fresh Session so it hasn't loaded the User row yet.
+        # 2. Call the helper with another Session.
         fresh = SessionLocal()
         try:
-            # Replace fresh.flush with a spy that raises IntegrityError on
-            # the first call. Direct attribute assignment on a Session
-            # instance works because SQLAlchemy binds methods via the
-            # instance's __dict__ via the sessionmaker's bind process.
-            # To make this rock-solid we patch the class method.
-            from sqlalchemy.orm import Session as _Session
-            original_session_flush = _Session.flush
-            call_count = {"n": 0}
-
-            def maybe_failing_flush(self, *args, **kwargs):
-                call_count["n"] += 1
-                if call_count["n"] == 1:
-                    raise IntegrityError(
-                        "INSERT", {}, Exception(
-                            "UNIQUE constraint failed: users.email"
-                        ),
-                    )
-                return original_session_flush(self, *args, **kwargs)
-
-            original_session_rollback = _Session.rollback
-            rollback_called = {"n": 0}
-
-            def counting_rollback(self, *args, **kwargs):
-                rollback_called["n"] += 1
-                return original_session_rollback(self, *args, **kwargs)
-
-            # Force the initial User-by-email lookup to return None so the
-            # helper enters the savepoint branch. We do this by replacing
-            # `query` on the bound session for one call.
             original_query = _Session.query
-            query_calls = {"n": 0}
+            first_lookup_forced = {"forced": False}
 
-            def null_first_query(self_, *a, **kw):
-                # First call to .query(...).filter_by(email=...).one_or_none()
-                # must return None. Subsequent calls go through to the real
-                # implementation.
-                result = original_query(self_, *a, **kw)
-                query_calls["n"] += 1
-                if query_calls["n"] == 1:
-                    # Stub one_or_none to return None on the first call.
-                    result.one_or_none = lambda: None
-                return result
+            def miss_first_email_lookup(self_, *entity, **kw):
+                real_query = original_query(self_, *entity, **kw)
+                # Narrow instrumentation: only the first query (the helper's
+                # initial email lookup) gets a one_or_none that misses; the
+                # recovery lookup runs the original implementation.
+                if not first_lookup_forced["forced"]:
+                    first_lookup_forced["forced"] = True
+                    real_query.one_or_none = lambda: None
+                return real_query
+
+            rollback_calls = {"n": 0}
+            original_rollback = _Session.rollback
+
+            def counting_rollback(self_, *args, **kwargs):
+                rollback_calls["n"] += 1
+                return original_rollback(self_, *args, **kwargs)
+
+            original_flush = _Session.flush
+            raised_exceptions = []
+            nested_tx_at_failure = []
+
+            def spying_flush(self_, *args, **kwargs):
+                try:
+                    return original_flush(self_, *args, **kwargs)
+                except Exception as exc:
+                    raised_exceptions.append(exc)
+                    # Record whether a nested transaction (savepoint) was
+                    # active at the moment the real DB error surfaced.
+                    nested_tx_at_failure.append(self_.in_nested_transaction())
+                    raise
 
             try:
-                _Session.flush = maybe_failing_flush
+                _Session.query = miss_first_email_lookup
                 _Session.rollback = counting_rollback
-                _Session.query = null_first_query
+                _Session.flush = spying_flush
                 result = _get_or_create_user(fresh, email)
             finally:
-                _Session.flush = original_session_flush
-                _Session.rollback = original_session_rollback
                 _Session.query = original_query
+                _Session.rollback = original_rollback
+                _Session.flush = original_flush
 
+            # Assertions
+            self.assertTrue(
+                first_lookup_forced["forced"],
+                "first lookup should have been forced to miss",
+            )
+            # The duplicate INSERT reached SQLite: the real flush raised
+            # exactly one IntegrityError whose orig is a genuine
+            # sqlite3.IntegrityError (i.e. not a mocked exception).
+            import sqlite3
+            self.assertEqual(
+                len(raised_exceptions), 1,
+                "exactly one real IntegrityError should have been raised by flush()",
+            )
+            real_exc = raised_exceptions[0]
+            self.assertIsInstance(real_exc, IntegrityError)
+            self.assertIsInstance(
+                real_exc.orig, sqlite3.IntegrityError,
+                "the IntegrityError must originate from the real SQLite driver",
+            )
+            # The genuine UNIQUE violation must have occurred while the
+            # nested transaction (savepoint) was active.
+            self.assertEqual(
+                nested_tx_at_failure, [True],
+                "the real UNIQUE failure must happen inside the savepoint",
+            )
             self.assertIsNotNone(result)
             self.assertEqual(result.email, email)
             self.assertEqual(
-                call_count["n"], 1,
-                "flush should have been called exactly once",
+                result.id, competing_id,
+                "recovered User must be the committed competing User",
             )
             self.assertEqual(
-                rollback_called["n"], 0,
-                "expected-recovery path must NOT call Session.rollback()",
+                rollback_calls["n"], 0,
+                "expected-recovery path must NOT call full Session.rollback()",
             )
+
+            # Session must remain usable after recovery.
+            usable = fresh.query(Activity).first()
+            self.assertIsNotNone(usable)
+
         finally:
             fresh.close()
 
-        # Sanity: still exactly one User row for that email.
+        # Exactly one User with that email afterwards.
         verify = SessionLocal()
         try:
             count = verify.query(User).filter_by(email=email).count()
